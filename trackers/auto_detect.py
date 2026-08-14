@@ -1,0 +1,141 @@
+"""Template gerektirmeyen (SiamDT'ye ozgu Siamese modullerden bagimsiz) tespit ve
+otomatik-baslatma/yeniden-tespit orkestrasyonu.
+
+Bu dosyadaki agir bagimliliklar (mmdet, torch, numpy, libs.ops) fonksiyon ici
+(local) import edilir; boylece Candidate/_select_candidates/AutoInitTracker'in
+saf mantik kismi bu paketler kurulu olmayan bir ortamda da import edilip test
+edilebilir. Bu dosya kasitli olarak hicbir sibling dosyaya (trackers/*, libs/*)
+top-level import ile bagli degil - baska bir kod tabanina kopyalanip
+yapistirilabilmesi icin.
+"""
+
+from collections import namedtuple
+
+Candidate = namedtuple('Candidate', ['bbox', 'score'])
+
+
+def _select_candidates(det_bboxes, score_thr, max_candidates):
+    """det_bboxes: her satiri [x1, y1, x2, y2, score] olan bir dizi (liste ya da
+    .tolist() metoduna sahip bir nesne, ör. torch.Tensor). score_thr altinda
+    kalanlar elenir, geri kalan skora gore azalan sekilde siralanip ilk
+    max_candidates tanesi dondurulur."""
+    rows = det_bboxes.tolist() if hasattr(det_bboxes, 'tolist') else list(det_bboxes)
+    candidates = [
+        Candidate(bbox=list(row[:4]), score=float(row[4]))
+        for row in rows
+        if row[4] >= score_thr
+    ]
+    candidates.sort(key=lambda c: c.score, reverse=True)
+    return candidates[:max_candidates]
+
+
+def free_detect(model, img_tensor, img_metas, score_thr=0.3, max_candidates=5):
+    """Template gerektirmeden, tum goruntude aday kutu arar. model.rpn_head'e
+    x_corr eklenmeden ham ozellik verilir; model.roi_head.bbox_head'in zaten
+    template'siz proposal'larla egitilmis "ham dali" kullanilir (bkz. tasarim
+    belgesi Bolum 4, Yaklasim A)."""
+    from mmdet.core import bbox2roi
+
+    x = model.extract_feat(img_tensor)
+    proposal_list = model.rpn_head.simple_test_rpn(x, img_metas)
+    rois = bbox2roi(proposal_list)
+    bbox_feats = model.roi_head.bbox_roi_extractor(
+        x[:model.roi_head.bbox_roi_extractor.num_inputs], rois)
+    cls_score, bbox_pred = model.roi_head.bbox_head(bbox_feats)
+    det_bboxes, _det_labels = model.roi_head.bbox_head.get_bboxes(
+        rois, cls_score, bbox_pred,
+        img_metas[0]['img_shape'], img_metas[0]['scale_factor'],
+        rescale=True, cfg=model.test_cfg.rcnn)
+    return _select_candidates(det_bboxes, score_thr, max_candidates)
+
+
+def default_preprocess(transforms, img, device):
+    """SiamDTTracker.update()'teki (trackers/siamdt_tracking.py:65-78) on-isleme
+    zinciriyle ayni: transforms._process_gallary + batch boyutu ekleme + cihaza
+    tasima. free_detect'in bekledigi (img_tensor, img_metas) ciftini uretir."""
+    img_meta = {'ori_shape': img.shape}
+    img_tensor, img_meta, _ = transforms._process_gallary(img, img_meta, None)
+    img_tensor = img_tensor.unsqueeze(0).contiguous().to(device, non_blocking=True)
+    return img_tensor, [img_meta]
+
+
+class AutoInitTracker:
+    """SiamDTTracker'in (veya init(img,bbox)/update(img) arayuzune sahip
+    herhangi bir tracker'in) etrafini saran, template-siz free_detect ile
+    otomatik baslatma ve kayip-hedef sonrasi yeniden-tespit yapan orkestrator.
+    Mevcut tracker/model siniflarinin ic detaylarina dokunmaz."""
+
+    def __init__(self, tracker, model, transforms, preprocess_fn=None,
+                 lost_thr=0.8, patience=1, score_thr=0.3, max_candidates=5):
+        self.tracker = tracker
+        self.model = model
+        self.transforms = transforms
+        self._preprocess_fn = preprocess_fn
+        self.lost_thr = lost_thr
+        self.patience = patience
+        self.score_thr = score_thr
+        self.max_candidates = max_candidates
+
+    def _preprocess(self, img):
+        if self._preprocess_fn is not None:
+            return self._preprocess_fn(img)
+        device = next(self.model.parameters()).device
+        return default_preprocess(self.transforms, img, device)
+
+    def _try_detect(self, img):
+        img_tensor, img_metas = self._preprocess(img)
+        return free_detect(
+            self.model, img_tensor, img_metas,
+            score_thr=self.score_thr, max_candidates=self.max_candidates)
+
+    def _run_loop(self, images):
+        """Saf orkestrasyon mantigi. images: onceden yuklenmis kare listesi
+        (turu _preprocess_fn'in kabul ettigi turle ayni olmali). Donus:
+        her karenin kutusunu iceren list[list[float]]."""
+        state = 'NEED_DETECT'
+        low_score_streak = 0
+        bboxes = []
+        for img in images:
+            if state == 'NEED_DETECT':
+                candidates = self._try_detect(img)
+                if candidates:
+                    self.tracker.init(img, candidates[0].bbox)
+                    state = 'TRACKING'
+                    low_score_streak = 0
+                    bboxes.append(candidates[0].bbox)
+                else:
+                    bboxes.append(bboxes[-1] if bboxes else [0.0, 0.0, 0.0, 0.0])
+            else:
+                bbox, _up_flag = self.tracker.update(img)
+                # bbox, SiamDTTracker.update()'ten gelirken bir GPU torch.Tensor
+                # olabilir (siamdt_tracking.py:46-47, CUDA varsa) - dogrudan
+                # np.array()'e vermek CUDA tensor'de patlar, once duz listeye cevir.
+                bboxes.append(bbox.tolist() if hasattr(bbox, 'tolist') else list(bbox))
+                score = getattr(self.model, '_last_score', 0.0)
+                if score < self.lost_thr:
+                    low_score_streak += 1
+                    if low_score_streak >= self.patience:
+                        state = 'NEED_DETECT'
+                        low_score_streak = 0
+                else:
+                    low_score_streak = 0
+        return bboxes
+
+    def forward_test(self, img_files, init_bbox=None, visualize=False):
+        """libs/tracker.py:37'deki Tracker.forward_test ile ayni imza/donus
+        sozlesmesi - EvaluatorUAVtir.run(auto_tracker, ...) bu sinifi
+        degistirmeden kabul edebilir. init_bbox kasitli olarak yok sayilir:
+        bu sinifin butun amaci init_bbox'a ihtiyac duymamak."""
+        import time
+
+        import numpy as np
+        import libs.ops as ops
+
+        images = [ops.read_image(f) for f in img_files]
+        begin = time.time()
+        bboxes_list = self._run_loop(images)
+        elapsed = time.time() - begin
+
+        frame_num = len(img_files)
+        times = np.full(frame_num, elapsed / max(frame_num, 1))
+        return np.array(bboxes_list, dtype=float), times
