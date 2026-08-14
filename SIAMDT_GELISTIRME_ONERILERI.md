@@ -74,6 +74,25 @@ mesafe cezası) eklenebilir.
 - **Öncelik:** Yüksek (düşük maliyet/yüksek fayda oranı; "global search" tracker'ların bilinen zayıf
   noktası tam olarak budur).
 
+**Neden Kalman/basit motion prior, optical flow değil?** Aynı problemi (hareket bilgisini modele
+katmak) optical flow ile çözmek de akla gelebilir, ama bu senaryoda değeri sınırlı:
+
+- **Kamera ego-motion'ı ayrımı bozuyor.** Optical flow'un asıl gücü, hareketli nesneyi durağan arka
+  plandan ayırmak. Anti-UAV410 görüntüleri genelde **hareketli bir kamera platformundan** çekiliyor
+  — bu durumda hem drone hem de arka plan optical flow'da "hareketli" görünür. Bu ayrımı gerçekten
+  kullanabilmek için önce kamera hareketi telafisi (motion compensation) gerekir, bu da işi ciddi
+  şekilde karmaşıklaştırır ve kapsam dışına taşırır.
+- **Ek hesap maliyeti.** Dense optical flow (klasik Farneback ya da öğrenilmiş bir FlowNet) her
+  karede ek bir hesaplama demek — gerçek-zamanlılık hedefiyle çelişebilir, halbuki Kalman-tabanlı
+  motion prior neredeyse sıfır maliyetli (sadece proposal skorlarına eklenen bir mesafe cezası).
+- **Kalman/motion prior aynı ihtiyacı çok daha ucuza karşılıyor.** Sadece hedefin kendi geçmiş
+  konum/hız bilgisini kullanır, kamera hareketinden etkilenmez, mevcut `_process_gallary` akışına
+  (Bölüm A5'teki gibi) küçük bir ek olarak entegre edilebilir.
+
+**Sonuç:** Önce A5'i (Kalman/basit motion prior) deneyip yeterli olup olmadığını ölçmek, optical
+flow'u ancak A5 yetersiz kalırsa (ör. çok manevralı hedeflerde) — ve o zaman da önce kamera hareketi
+telafisiyle birlikte — değerlendirmek daha isabetli bir sıralama.
+
 ---
 
 ## B. Eğitim & Veri Pipeline Geliştirmeleri
