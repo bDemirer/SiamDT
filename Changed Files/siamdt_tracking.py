@@ -149,7 +149,7 @@ class SiamDTTracker(Tracker):
                         continue
 
                     iou = self._compute_iou(self.prev_bbox, box)
-                    combined_score = scores[i] + (0.8 * iou)
+                    combined_score = scores[i] + (1.6 * iou)
                     scored_candidates.append((combined_score, i))
 
                 if len(scored_candidates) > 0:
