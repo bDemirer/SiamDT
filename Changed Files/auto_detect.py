@@ -37,7 +37,7 @@ def _select_candidates(det_bboxes, score_thr, max_candidates, min_area=1.0):
     return candidates[:max_candidates]
 
 
-def free_detect(model, img_tensor, img_metas, score_thr=0.6, max_candidates=5,
+def free_detect(model, img_tensor, img_metas, score_thr=0.06, max_candidates=5,
                  min_area=1.0):
     """Template gerektirmeden, tum goruntude aday kutu arar. model.rpn_head'e
     x_corr eklenmeden ham ozellik verilir; model.roi_head.bbox_head'in zaten
