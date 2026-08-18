@@ -32,13 +32,14 @@ from visdom import Visdom
 import libs.data as data
 import libs.ops as ops
 from trackers import SiamDTTracker
-from trackers.auto_detect import free_detect, default_preprocess
+from trackers.auto_detect import AutoInitTracker
 
 # =====================================================================
 #   AYARLAR -- parametre yerine burada elle degistir
 # =====================================================================
 FRAME_DIR = '/home/gorsis3/Desktop/staj/2_Etiketlenecek_Veri/gorsel'                      # islenecek kare klasoru
-NUM_FRAMES = 2000                                     # islenecek kare sayisi (bastan itibaren)
+NUM_FRAMES = 1900                                  # islenecek kare sayisi (START_FRAME_INDEX'ten itibaren)
+START_FRAME_INDEX = 1700                          # siralanmis dosya listesinde baslanacak sira (0 = bastan)
 
 CONFIG_FILE = 'configs/siamdt_swin_tiny_sgd.py'
 CHECKPOINT_FILE = '/home/gorsis3/Desktop/staj/SiamDT/work_dirs/siamdt_swin_tiny_sgd/epoch_2.pth'
@@ -65,23 +66,29 @@ def _natural_sort_key(path):
     return (int(digits[-1]), name) if digits else (float('inf'), name)
 
 
-def list_frame_files(frame_dir, num_frames):
+def list_frame_files(frame_dir, num_frames, start_frame_index=0):
     files = []
     for pattern in ('*.jpg', '*.jpeg', '*.png', '*.bmp'):
         files.extend(glob.glob(osp.join(frame_dir, pattern)))
     files = sorted(files, key=_natural_sort_key)
     if not files:
         raise FileNotFoundError(f'{frame_dir} icinde goruntu dosyasi bulunamadi.')
-    if len(files) < num_frames:
-        print(f'[UYARI] {num_frames} kare istendi ama klasorde {len(files)} tane var, '
-              f'{len(files)} ile devam ediliyor.')
-        num_frames = len(files)
-    return files[:num_frames]
+    if start_frame_index >= len(files):
+        raise ValueError(
+            f'START_FRAME_INDEX={start_frame_index} ama klasorde sadece {len(files)} kare var '
+            f'(gecerli araligim: 0-{len(files) - 1}).')
+    available = len(files) - start_frame_index
+    if available < num_frames:
+        print(f'[UYARI] {start_frame_index}. kareden itibaren {num_frames} kare istendi ama '
+              f'sadece {available} kare kaldi, {available} ile devam ediliyor.')
+        num_frames = available
+    return files[start_frame_index:start_frame_index + num_frames]
 
 
 def main():
-    frame_paths = list_frame_files(FRAME_DIR, NUM_FRAMES)
-    print(f'{len(frame_paths)} kare islenecek (kaynak: {FRAME_DIR})')
+    frame_paths = list_frame_files(FRAME_DIR, NUM_FRAMES, START_FRAME_INDEX)
+    print(f'{len(frame_paths)} kare islenecek (kaynak: {FRAME_DIR}, '
+          f'baslangic index: {START_FRAME_INDEX})')
 
     run_name = RUN_NAME or (
         osp.basename(osp.normpath(FRAME_DIR)) + '_' + time.strftime('%Y%m%d_%H%M%S'))
@@ -107,13 +114,25 @@ def main():
         CONFIG_FILE, CHECKPOINT_FILE, transforms,
         name_suffix=run_name + '_auto', visualize=False)
 
-    print(f'Tracker hazir (score_thr={SCORE_THR}, lost_thr={LOST_THR}, patience={PATIENCE})')
+    auto_tracker = AutoInitTracker(
+        tracker, tracker.model, transforms,
+        lost_thr=LOST_THR, patience=PATIENCE, score_thr=SCORE_THR,
+        detect_size_mult_start=DETECT_SIZE_MULT_START,
+        detect_size_mult_step=DETECT_SIZE_MULT_STEP,
+        detect_size_mult_max=DETECT_SIZE_MULT_MAX)
+    print(f'AutoInitTracker hazir (score_thr={SCORE_THR}, lost_thr={LOST_THR}, patience={PATIENCE})')
 
     images = (ops.read_image(p) for p in frame_paths)
 
     boxes = []  # sadece kutu konumlari -> test_results/predictions/<run_name>.json
 
     def on_frame(f, img, bbox, up_flag, mode):
+        # ops.read_image() (PIL -> np.asarray) bazen salt-okunur bir array
+        # donduruyor; cv2.putText yerinde yazma yaptigi icin yazilabilir
+        # bir kopya gerekiyor. Tracker zaten img'i bu noktadan ONCE kullanip
+        # islemini bitirdi, o yuzden burada kopyalamak islevi etkilemiyor.
+        img = img.copy()
+
         # Hangi mekanizmanin bu kareyi urettigini kucuk bir metinle karenin
         # uzerine yaz (DETECT / NO-DETECT / TRACK / TRACK-FALLBACK). Bunu
         # show_image()'DAN ONCE cizmek gerekiyor: show_image kendi
@@ -141,53 +160,11 @@ def main():
             print(f'  [{f + 1}/{len(frame_paths)}] mode={mode} '
                   f'bbox={[round(v, 1) for v in bbox]}')
 
-    # --- AutoInitTracker._run_loop ile AYNI durum makinesi, elle yurutuluyor
-    # -- boylece hangi mekanizmanin (DETECT / TRACK / TRACK-FALLBACK)
-    # kullanildigini da uretebiliyoruz. AutoInitTracker'in kendi (protected)
-    # ic metodlarina bagimli olmamak icin free_detect/default_preprocess
-    # dogrudan kullaniliyor. NOT: 'TRACK-FALLBACK' etiketi, siamdt_tracking.py
-    # icindeki update()'e eklenen self._last_selection_mode kancasina
-    # bagimli -- o kanca yoksa hepsi 'TRACK' gorunur.
-    state = 'NEED_DETECT'
-    low_score_streak = 0
+
     begin = time.time()
-    for f, img in enumerate(images):
-        if state == 'NEED_DETECT':
-            img_tensor, img_metas = default_preprocess(
-                transforms, img, next(tracker.model.parameters()).device)
-            candidates = free_detect(
-                tracker.model, img_tensor, img_metas,
-                score_thr=SCORE_THR, max_candidates=5)
-            if candidates:
-                tracker.init(img, candidates[0].bbox)
-                state = 'TRACKING'
-                low_score_streak = 0
-                bbox = candidates[0].bbox
-                up_flag = True
-                mode = 'DETECT'
-            else:
-                bbox = boxes[-1] if boxes else [0.0, 0.0, 0.0, 0.0]
-                up_flag = False
-                mode = 'NO-DETECT'
-        else:
-            bbox, up_flag = tracker.update(img)
-            bbox = bbox.tolist() if hasattr(bbox, 'tolist') else list(bbox)
-            selection_mode = getattr(tracker.model, '_last_selection_mode', None)
-            mode = 'TRACK-FALLBACK' if selection_mode == 'fallback' else 'TRACK'
-            score = getattr(tracker.model, '_last_score', 0.0)
-            if score < LOST_THR:
-                low_score_streak += 1
-                if low_score_streak >= PATIENCE:
-                    state = 'NEED_DETECT'
-                    low_score_streak = 0
-            else:
-                low_score_streak = 0
-        on_frame(f, img, bbox, up_flag, mode)
+    auto_tracker._run_loop(images, on_frame=on_frame)
     elapsed = time.time() - begin
 
-    # --- Tahminleri (kutu konumlarini) kaydet ---
-    # {'res': [...]} -- libs/data/evaluators/uavtir_eval.py'nin kendi sonuc
-    # dosyalarinda kullandigi formatla ayni.
     pred_file = osp.join(preds_out_dir, f'{run_name}.json')
     with open(pred_file, 'w') as f_out:
         json.dump({'res': boxes}, f_out)
