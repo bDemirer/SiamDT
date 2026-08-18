@@ -75,7 +75,9 @@ class AutoInitTracker:
     Mevcut tracker/model siniflarinin ic detaylarina dokunmaz."""
 
     def __init__(self, tracker, model, transforms, preprocess_fn=None,
-             lost_thr=0.8, patience=1, score_thr=0.06, max_candidates=5):
+             lost_thr=0.8, patience=1, score_thr=0.06, max_candidates=5,
+             detect_size_mult_start=1.3, detect_size_mult_step=0.3,
+             detect_size_mult_max=3.0):
         self.tracker = tracker
         self.model = model
         self.transforms = transforms
@@ -84,6 +86,9 @@ class AutoInitTracker:
         self.patience = patience
         self.score_thr = score_thr
         self.max_candidates = max_candidates
+        self.detect_size_mult_start = detect_size_mult_start
+        self.detect_size_mult_step = detect_size_mult_step
+        self.detect_size_mult_max = detect_size_mult_max
 
     def _preprocess(self, img):
         if self._preprocess_fn is not None:
@@ -98,34 +103,47 @@ class AutoInitTracker:
             score_thr=self.score_thr, max_candidates=self.max_candidates)
 
     def _run_loop(self, images, on_frame=None):
-        """Saf orkestrasyon mantigi. images: onceden yuklenmis kare listesi
-        (turu _preprocess_fn'in kabul ettigi turle ayni olmali). Donus:
-        her karenin kutusunu iceren list[list[float]].
-
-        on_frame: opsiyonel, imzasi on_frame(frame_idx, img, bbox, up_flag)
-        olan bir callable. Her kare islendikten SONRA cagirilir (ör.
-        gorsellestirme/kayit icin) - mevcut testler bu parametreyi hic
-        kullanmadigindan (None birakildigindan) davranislarini etkilemez."""
         state = 'NEED_DETECT'
         low_score_streak = 0
+        detect_fail_streak = 0
         bboxes = []
         for f, img in enumerate(images):
             if state == 'NEED_DETECT':
                 candidates = self._try_detect(img)
+
+                last_bbox = getattr(self.tracker, 'prev_bbox', None)
+                if last_bbox is not None and candidates:
+                    last_w = last_bbox[2] - last_bbox[0]
+                    last_h = last_bbox[3] - last_bbox[1]
+                    size_mult = min(
+                        self.detect_size_mult_start
+                        + self.detect_size_mult_step * detect_fail_streak,
+                        self.detect_size_mult_max)
+                    candidates = [
+                        c for c in candidates
+                        if (c.bbox[2] - c.bbox[0]) <= size_mult * last_w
+                        and (c.bbox[3] - c.bbox[1]) <= size_mult * last_h
+                    ]
+
                 if candidates:
                     self.tracker.init(img, candidates[0].bbox)
                     state = 'TRACKING'
                     low_score_streak = 0
+                    detect_fail_streak = 0
                     bbox = candidates[0].bbox
-                    up_flag = True  # yeni baslatma = "guncellendi"
+                    up_flag = True
+                    mode = 'DETECT'
                 else:
+                    detect_fail_streak += 1
                     bbox = bboxes[-1] if bboxes else [0.0, 0.0, 0.0, 0.0]
                     up_flag = False
+                    mode = 'NO-DETECT'
             else:
                 bbox, up_flag = self.tracker.update(img)
                 bbox = bbox.tolist() if hasattr(bbox, 'tolist') else list(bbox)
                 score = getattr(self.model, '_last_score', 0.0)
                 selection_mode = getattr(self.model, '_last_selection_mode', None)
+                mode = 'TRACK-FALLBACK' if selection_mode == 'fallback' else 'TRACK'
 
                 if selection_mode == 'fallback':
                     state = 'NEED_DETECT'
@@ -135,13 +153,12 @@ class AutoInitTracker:
                     if low_score_streak >= self.patience:
                         state = 'NEED_DETECT'
                         low_score_streak = 0
-
                 else:
                     low_score_streak = 0
 
             bboxes.append(bbox)
             if on_frame is not None:
-                on_frame(f, img, bbox, up_flag)
+                on_frame(f, img, bbox, up_flag, mode)
         return bboxes
 
     def forward_test(self, img_files, init_bbox=None, visualize=False,
@@ -178,7 +195,7 @@ class AutoInitTracker:
 
         on_frame = None
         if do_visualize and viz is not None:
-            def on_frame(f, img, bbox, up_flag):
+            def on_frame(f, img, bbox, up_flag, mode):
                 if gt_ok:
                     ops.show_image(
                         img, [gt_bboxes[f], bbox], f, up_flag, viz,
