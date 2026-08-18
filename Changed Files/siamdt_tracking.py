@@ -167,7 +167,7 @@ class SiamDTTracker(Tracker):
                     else:
                         best_ind = 0
 
-                self._last_selection_mode = 'reranked' if len(scored_candidates) > 0 else 'fallback'
+                self.model._last_selection_mode = 'reranked' if len(scored_candidates) > 0 else 'fallback'
                 # --- Hafıza Güncellemesi İçin NumPy Koordinatları (ltrb) ---
                 selected_box = np.copy(boxes[best_ind])  # [x1,y1,x2,y2]
 
