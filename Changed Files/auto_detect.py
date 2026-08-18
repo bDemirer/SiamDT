@@ -123,18 +123,22 @@ class AutoInitTracker:
                     up_flag = False
             else:
                 bbox, up_flag = self.tracker.update(img)
-                # bbox, SiamDTTracker.update()'ten gelirken bir GPU torch.Tensor
-                # olabilir (siamdt_tracking.py:46-47, CUDA varsa) - dogrudan
-                # np.array()'e vermek CUDA tensor'de patlar, once duz listeye cevir.
                 bbox = bbox.tolist() if hasattr(bbox, 'tolist') else list(bbox)
                 score = getattr(self.model, '_last_score', 0.0)
-                if score < self.lost_thr:
+                selection_mode = getattr(self.model, '_last_selection_mode', None)
+
+                if selection_mode == 'fallback':
+                    state = 'NEED_DETECT'
+                    low_score_streak = 0
+                elif score < self.lost_thr:
                     low_score_streak += 1
                     if low_score_streak >= self.patience:
                         state = 'NEED_DETECT'
                         low_score_streak = 0
+
                 else:
                     low_score_streak = 0
+
             bboxes.append(bbox)
             if on_frame is not None:
                 on_frame(f, img, bbox, up_flag)
