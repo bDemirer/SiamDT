@@ -37,7 +37,7 @@ def _select_candidates(det_bboxes, score_thr, max_candidates, min_area=1.0):
     return candidates[:max_candidates]
 
 
-def free_detect(model, img_tensor, img_metas, score_thr=0.3, max_candidates=5,
+def free_detect(model, img_tensor, img_metas, score_thr=0.6, max_candidates=5,
                  min_area=1.0):
     """Template gerektirmeden, tum goruntude aday kutu arar. model.rpn_head'e
     x_corr eklenmeden ham ozellik verilir; model.roi_head.bbox_head'in zaten
@@ -75,7 +75,7 @@ class AutoInitTracker:
     Mevcut tracker/model siniflarinin ic detaylarina dokunmaz."""
 
     def __init__(self, tracker, model, transforms, preprocess_fn=None,
-                 lost_thr=0.8, patience=1, score_thr=0.3, max_candidates=5):
+             lost_thr=0.8, patience=1, score_thr=0.06, max_candidates=5):
         self.tracker = tracker
         self.model = model
         self.transforms = transforms
@@ -97,29 +97,36 @@ class AutoInitTracker:
             self.model, img_tensor, img_metas,
             score_thr=self.score_thr, max_candidates=self.max_candidates)
 
-    def _run_loop(self, images):
+    def _run_loop(self, images, on_frame=None):
         """Saf orkestrasyon mantigi. images: onceden yuklenmis kare listesi
         (turu _preprocess_fn'in kabul ettigi turle ayni olmali). Donus:
-        her karenin kutusunu iceren list[list[float]]."""
+        her karenin kutusunu iceren list[list[float]].
+
+        on_frame: opsiyonel, imzasi on_frame(frame_idx, img, bbox, up_flag)
+        olan bir callable. Her kare islendikten SONRA cagirilir (ör.
+        gorsellestirme/kayit icin) - mevcut testler bu parametreyi hic
+        kullanmadigindan (None birakildigindan) davranislarini etkilemez."""
         state = 'NEED_DETECT'
         low_score_streak = 0
         bboxes = []
-        for img in images:
+        for f, img in enumerate(images):
             if state == 'NEED_DETECT':
                 candidates = self._try_detect(img)
                 if candidates:
                     self.tracker.init(img, candidates[0].bbox)
                     state = 'TRACKING'
                     low_score_streak = 0
-                    bboxes.append(candidates[0].bbox)
+                    bbox = candidates[0].bbox
+                    up_flag = True  # yeni baslatma = "guncellendi"
                 else:
-                    bboxes.append(bboxes[-1] if bboxes else [0.0, 0.0, 0.0, 0.0])
+                    bbox = bboxes[-1] if bboxes else [0.0, 0.0, 0.0, 0.0]
+                    up_flag = False
             else:
-                bbox, _up_flag = self.tracker.update(img)
+                bbox, up_flag = self.tracker.update(img)
                 # bbox, SiamDTTracker.update()'ten gelirken bir GPU torch.Tensor
                 # olabilir (siamdt_tracking.py:46-47, CUDA varsa) - dogrudan
                 # np.array()'e vermek CUDA tensor'de patlar, once duz listeye cevir.
-                bboxes.append(bbox.tolist() if hasattr(bbox, 'tolist') else list(bbox))
+                bbox = bbox.tolist() if hasattr(bbox, 'tolist') else list(bbox)
                 score = getattr(self.model, '_last_score', 0.0)
                 if score < self.lost_thr:
                     low_score_streak += 1
@@ -128,6 +135,9 @@ class AutoInitTracker:
                         low_score_streak = 0
                 else:
                     low_score_streak = 0
+            bboxes.append(bbox)
+            if on_frame is not None:
+                on_frame(f, img, bbox, up_flag)
         return bboxes
 
     def forward_test(self, img_files, init_bbox=None, visualize=False,
@@ -136,20 +146,44 @@ class AutoInitTracker:
         sozlesmesi - EvaluatorUAVtir.run(auto_tracker, ...) bu sinifi
         degistirmeden kabul edebilir. init_bbox kasitli olarak yok sayilir:
         bu sinifin butun amaci init_bbox'a ihtiyac duymamak. gt_bboxes de
-        ayni sekilde yok sayilir (bazi ozel evaluator/Tracker surumleri
-        gorsellestirme/kayit icin GT'yi forward_test'e ayrica geciriyor);
-        AutoInitTracker gt_bboxes'i TAKIP MANTIGINDA KULLANMAZ - bu,
-        "otomatik baslatma" hedefiyle celisir. **kwargs, ileride gelebilecek
-        baska ozel argumanlarin da sessizce yutulup crash'e sebep olmamasi
-        icin."""
+        ayni sekilde yok sayilir. **kwargs, ileride gelebilecek baska ozel
+        argumanlarin da sessizce yutulup crash'e sebep olmamasi icin.
+
+        Gorsellestirme/kayit: sarilan self.tracker'in KENDI visualize/viz
+        durumunu (Tracker.__init__'te visualize=True ise zaten kurulu olan
+        visdom baglantisi) yeniden kullanir - yeni bir Visdom baglantisi
+        ACMAZ, farkli bir kayit mekanizmasi UYDURMAZ. ops.show_image, ayni
+        Tracker.forward_test'in cagirdigi sekilde (fig parametresi
+        verilmeden, yani varsayilan/sabit pencere adiyla) cagirilir - bu
+        da ayni kayit/goruntuleme davranisini (ör. ACTIVE_SAVE_DIR tabanli
+        kare kaydi, varsa) DEGISTIRMEDEN korur ve tek, surekli guncellenen
+        bir pencere ('video oynatimi' gorunumu) saglar. gt_bboxes verilirse
+        (ve img_files ile ayni uzunluktaysa), GT (yesil) ve tahmin
+        (kirmizi) BIRLIKTE ciziliyor - GT sadece kayit icin degil, gorsel
+        karsilastirma icin de kullaniliyor artik."""
         import time
 
         import numpy as np
         import libs.ops as ops
 
         images = [ops.read_image(f) for f in img_files]
+
+        do_visualize = getattr(self.tracker, 'visualize', False)
+        viz = getattr(self.tracker, 'viz', None)
+        gt_ok = gt_bboxes is not None and len(gt_bboxes) == len(img_files)
+
+        on_frame = None
+        if do_visualize and viz is not None:
+            def on_frame(f, img, bbox, up_flag):
+                if gt_ok:
+                    ops.show_image(
+                        img, [gt_bboxes[f], bbox], f, up_flag, viz,
+                        colors=[(0, 255, 0), (0, 0, 255)])  # yesil=GT, kirmizi=tahmin
+                else:
+                    ops.show_image(img, bbox, f, up_flag, viz)
+
         begin = time.time()
-        bboxes_list = self._run_loop(images)
+        bboxes_list = self._run_loop(images, on_frame=on_frame)
         elapsed = time.time() - begin
 
         frame_num = len(img_files)
